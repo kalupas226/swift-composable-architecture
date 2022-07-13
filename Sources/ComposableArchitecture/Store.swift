@@ -495,7 +495,7 @@ public final class Store<State, Action> {
       guard self.stackChecksEnabled else { return }
       // Disable in scoped stores
       guard self.parentCancellable == nil else { return }
-      let threshold: UInt = 50_000
+      let threshold: UInt = 10_000
       let status = StackStatus()
       if status.available > threshold { return }
 
