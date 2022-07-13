@@ -141,6 +141,7 @@ public final class Store<State, Action> {
   var state: CurrentValueSubject<State, Never>
   #if DEBUG
     private let mainThreadChecksEnabled: Bool
+    var stackChecksEnabled: Bool
   #endif
 
   /// Initializes a store from an initial state, a reducer, and an environment.
@@ -158,9 +159,10 @@ public final class Store<State, Action> {
       initialState: initialState,
       reducer: reducer,
       environment: environment,
-      mainThreadChecksEnabled: true
+      mainThreadChecksEnabled: true,
+      stackChecksEnabled: true
     )
-    self.threadCheck(status: .`init`)
+    self.performChecks(event: .`init`)
   }
 
   /// Scopes the store to one that exposes local state and actions.
@@ -307,7 +309,7 @@ public final class Store<State, Action> {
     state toLocalState: @escaping (State) -> LocalState,
     action fromLocalAction: @escaping (LocalAction) -> Action
   ) -> Store<LocalState, LocalAction> {
-    self.threadCheck(status: .scope)
+    self.performChecks(event: .scope)
     var isSending = false
     let localStore = Store<LocalState, LocalAction>(
       initialState: toLocalState(self.state.value),
@@ -342,7 +344,7 @@ public final class Store<State, Action> {
   }
 
   func send(_ action: Action, originatingFrom originatingAction: Action? = nil) {
-    self.threadCheck(status: .send(action, originatingAction: originatingAction))
+    self.performChecks(event: .send(action, originatingAction: originatingAction))
 
     self.bufferedActions.append(action)
     guard !self.isSending else { return }
@@ -362,7 +364,7 @@ public final class Store<State, Action> {
       let uuid = UUID()
       let effectCancellable = effect.sink(
         receiveCompletion: { [weak self] _ in
-          self?.threadCheck(status: .effectCompletion(action))
+          self?.performChecks(event: .effectCompletion(action))
           didComplete = true
           self?.effectCancellables[uuid] = nil
         },
@@ -388,7 +390,7 @@ public final class Store<State, Action> {
     return self.scope(state: { $0 }, action: absurd)
   }
 
-  private enum ThreadCheckStatus {
+  private enum Event {
     case effectCompletion(Action)
     case `init`
     case scope
@@ -396,12 +398,19 @@ public final class Store<State, Action> {
   }
 
   @inline(__always)
-  private func threadCheck(status: ThreadCheckStatus) {
+  private func performChecks(event: Event) {
     #if DEBUG
+      threadCheck(event: event)
+      stackCheck(event: event)
+    #endif
+  }
+
+    #if DEBUG
+    private func threadCheck(event: Event) {
       guard self.mainThreadChecksEnabled && !Thread.isMainThread
       else { return }
 
-      switch status {
+      switch event {
       case let .effectCompletion(action):
         runtimeWarning(
           """
@@ -478,20 +487,82 @@ public final class Store<State, Action> {
           ]
         )
       }
-    #endif
   }
+    #endif
+    
+    #if DEBUG
+    private func stackCheck(event: Event) {
+      guard self.stackChecksEnabled else { return }
+      // Disable in scoped stores
+      guard self.parentCancellable == nil else { return }
+      let threshold: UInt = 50_000
+      let status = StackStatus()
+      if status.available > threshold { return }
+
+      // We warn only once, but scoped stores could pass through on `init` as their
+      // parent cancellable is nil at this point.
+      guard Thread.current.threadDictionary[ObjectIdentifier(StackStatus.self)] == nil
+      else { return }
+      defer {
+        self.stackChecksEnabled = false
+        Thread.current.threadDictionary[ObjectIdentifier(StackStatus.self)] = ()
+      }
+
+      runtimeWarning(
+        """
+        The thread's stack depth is reaching %@ of its capacity. …
+        
+          Stack size:
+            %@
+        
+          Used stack memory:
+            %@
+        
+          Available stack memory:
+            %@
+        
+          Size on the stack of the %@ state managed by this store:
+            %@
+        
+        If the stack deepens more, it risks to overflow and the app will crash.
+            
+        The state that this store manages is occupying %@ on the stack. If this value is \
+        too large with respect to the stack size and your app logic, you can relocate some of its \
+        properties on the heap. If a property is a value type, you can try to "box" it into a \
+        reference type. One way to achieve this is using a dedicated property wrapper (See \
+        "https://github.com/apple/swift/blob/main/docs/OptimizationTips.rst\
+        #advice-use-copy-on-write-semantics-for-large-values" for example). If the property is an \
+        "enum", you can simply mark it as "indirect", producing the same effect.
+        
+        "Array", "Set", "Dictionary" or "IdentifiedArray" are already storing their content on the \
+        heap.
+        """,
+        [
+          String(format: "%.0f%%", status.usedFraction * 100),
+          "\(status.stackSize) bytes",
+          "\(status.used) bytes",
+          "\(status.available) bytes",
+          "\(State.self)",
+          "\(MemoryLayout<State>.size) bytes",
+          "\(MemoryLayout<State>.size) bytes"
+        ]
+      )
+    }
+    #endif
 
   init<Environment>(
     initialState: State,
     reducer: Reducer<State, Action, Environment>,
     environment: Environment,
-    mainThreadChecksEnabled: Bool
+    mainThreadChecksEnabled: Bool,
+    stackChecksEnabled: Bool
   ) {
     self.state = CurrentValueSubject(initialState)
     self.reducer = { state, action in reducer.run(&state, action, environment) }
 
     #if DEBUG
       self.mainThreadChecksEnabled = mainThreadChecksEnabled
+      self.stackChecksEnabled = stackChecksEnabled
     #endif
   }
 }

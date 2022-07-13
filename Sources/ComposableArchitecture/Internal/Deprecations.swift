@@ -30,7 +30,8 @@ extension Store {
       initialState: initialState,
       reducer: reducer,
       environment: environment,
-      mainThreadChecksEnabled: false
+      mainThreadChecksEnabled: false,
+      stackChecksEnabled: false
     )
   }
 }
